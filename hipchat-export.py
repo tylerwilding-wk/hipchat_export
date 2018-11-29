@@ -39,6 +39,7 @@ Options:
                         *** Generate this token online at
                         https://coa.hipchat.com/account/api ***
   -x, --extract_users User ID(s) to extract (comma separated list)
+  -r, --extract_rooms Room names to extract message history (comma separated list)
 
 Examples:
 
@@ -92,9 +93,9 @@ def vlog(msg):
 def take5():
     global TOTAL_REQUESTS
     log("\nHipChat API rate limit exceeded! Script will pause for 5 minutes then resume.")
-    log("   Please do not kill the script during this pause -- I was too lazy to make")
-    log("   it any smarter, so you'll have to start all over from the beginning... ;-)")
-    log(' ')
+    log("   If you kill the script that is O.K, since all the users/rooms you've exported are saved")
+    log("   in the `previous_users/rooms` file.  May be issues if you kill it mid-exporting a user/room though!")
+    log("   If so, just remove the entry from the respective file")
     for i in range(310, -1, -1):
         sleep(1)
         sys.stdout.write("\r%d sec remaining to resume..." % i)
@@ -123,17 +124,24 @@ def get_user_list(user_token):
     # Return value will be a dictionary
     user_list = {}
 
-    # Fetch the user list from the API
     url = HIPCHAT_API_URL + "/user"
-    r = requests.get(url, headers=headers)
-    TOTAL_REQUESTS += 1
 
-    if 'error' in r.json():
-        raise ApiError(r.json().get('error'))
+    MORE_RECORDS = True
+    while MORE_RECORDS:
+        # Fetch the user list from the API
+        r = requests.get(url, headers=headers)
+        TOTAL_REQUESTS += 1
 
-    # Iterate through the users and make a dict to return
-    for person in r.json()['items']:
-        user_list[str(person['id'])] = person['name']
+        if 'error' in r.json():
+            raise ApiError(r.json().get('error'))
+        # Iterate through the users and make a dict to return
+        for person in r.json()['items']:
+            user_list[str(person['id'])] = person['name']
+
+        if 'next' in r.json()['links']:
+            url = r.json()['links']['next']
+        else:
+            MORE_RECORDS = False
 
     # Return the dict
     return user_list
@@ -150,17 +158,9 @@ def display_userlist(user_list):
         print(name.ljust(col_width), u_id)
 
 
-def message_export(user_token, user_id, user_name):
+def message_export(user_token, user_id_or_room_name, user_name_or_room_name, is_for_users):
     # Set HTTP header to use user token for auth
     headers = {'Authorization': 'Bearer ' + user_token}
-
-    # create dirs for current user
-    dir_name = os.path.join(EXPORT_DIR, user_name)
-    if not os.path.isdir(dir_name):
-        os.makedirs(dir_name)
-    dir_name = os.path.join(FILE_DIR, user_id)
-    if not os.path.isdir(dir_name):
-        os.makedirs(dir_name)
 
     # flag to control pagination
     MORE_RECORDS = True
@@ -176,7 +176,11 @@ def message_export(user_token, user_id, user_name):
 
     # Set initial URL with correct user_id
     global HIPCHAT_API_URL
-    url = HIPCHAT_API_URL + "/user/%s/history?date=%s&reverse=false" % (user_id, int(time()))
+
+    if is_for_users:
+        url = HIPCHAT_API_URL + "/user/%s/history?date=%s&reverse=false" % (user_id_or_room_name, int(time()))
+    else:
+        url = HIPCHAT_API_URL + "/room/%s/history?date=%s&reverse=false" % (user_id_or_room_name, int(time()))
 
     # main loop to fetch and save messages
     while MORE_RECORDS:
@@ -191,7 +195,6 @@ def message_export(user_token, user_id, user_name):
         # Check the REQ count...
         check_requests_vs_limit()
 
-        # TODO - check response code for other errors and report out
         if not r.status_code == requests.codes.ok:
             if r.status_code == 429:
                 # Hit the rate limit! trigger the 5m pause...
@@ -205,38 +208,49 @@ def message_export(user_token, user_id, user_name):
         if 'items' not in r.json():
             raise Usage("Could not find messages in API return data... Check your token and try again.")
 
-        # write the current JSON dump to file
-        file_name = os.path.join(EXPORT_DIR, user_name, str(LEVEL) + '.txt')
-        vlog("  + writing JSON to disk: %s" % (file_name))
-        with io.open(file_name, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(r.json(), sort_keys=True, indent=4, ensure_ascii=False))
+        # write the current JSON dump to file if there are actually messages there
+        if len(r.json()['items']) > 0:
+            # create dirs for current user
+            dir_name = os.path.join(EXPORT_DIR, user_name_or_room_name)
+            if not os.path.isdir(dir_name):
+                os.makedirs(dir_name)
+            dir_name = os.path.join(FILE_DIR, user_id_or_room_name)
+            if not os.path.isdir(dir_name):
+                os.makedirs(dir_name)
 
-        if GET_FILE_UPLOADS:
-            # scan for any file links (aws), fetch them and save to disk
-            vlog("  + looking for file uploads in current message batch...")
-            for item in r.json()['items']:
-                if 'file' in item:
-                    vlog("  + fetching file: %s" % (item['file']['url']))
-                    r2 = requests.get(item['file']['url'])
-                    TOTAL_REQUESTS += 1
+            file_name = os.path.join(EXPORT_DIR, user_name_or_room_name, str(LEVEL) + '.json')
+            vlog("  + writing JSON to disk: %s" % (file_name))
+            with io.open(file_name, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(r.json(), sort_keys=True, indent=4, ensure_ascii=False))
 
-                    # extract the unique part of the URI to use as a file name
-                    fname = '/'.join(urlparse(item['file']['url']).path.split('/')[-3:])
-                    fpath = os.path.join(FILE_DIR, fname)
+            if GET_FILE_UPLOADS:
+                # scan for any file links (aws), fetch them and save to disk
+                vlog("  + looking for file uploads in current message batch...")
+                for item in r.json()['items']:
+                    if 'file' in item:
+                        vlog("  + fetching file: %s" % (item['file']['url']))
+                        r2 = requests.get(item['file']['url'])
+                        TOTAL_REQUESTS += 1
 
-                    # ensure full dir for the path exists
-                    temp_d = os.path.dirname(fpath)
-                    if not os.path.exists(temp_d):
-                        os.makedirs(temp_d)
+                        # extract the unique part of the URI to use as a file name
+                        fname = '/'.join(urlparse(item['file']['url']).path.split('/')[-3:])
+                        fpath = os.path.join(FILE_DIR, fname)
 
-                    # now fetch the file and write it to disk
-                    vlog("  --+ writing to disk: %s" % (fpath))
-                    with open(fpath, 'w+b') as fd:
-                        for chunk in r2.iter_content(1024):
-                            fd.write(chunk)
+                        # ensure full dir for the path exists
+                        temp_d = os.path.dirname(fpath)
+                        if not os.path.exists(temp_d):
+                            os.makedirs(temp_d)
 
-                    # Check the REQ count...
-                    check_requests_vs_limit()
+                        # now fetch the file and write it to disk
+                        vlog("  --+ writing to disk: %s" % (fpath))
+                        with open(fpath, 'w+b') as fd:
+                            for chunk in r2.iter_content(1024):
+                                fd.write(chunk)
+
+                        # Check the REQ count...
+                        check_requests_vs_limit()
+        else:
+            vlog("No messages exchanged between you and " + user_name_or_room_name + " skipping to reduce folder spam...")
 
         # check for more records to process
         if 'next' in r.json()['links']:
@@ -264,8 +278,27 @@ def main(argv=None):
     ACTION = "PROCESS"
     USER_TOKEN = None
     IDS_TO_EXTRACT = None
+    ROOMS_TO_EXTRACT = None
     USER_LIST = {}
     USER_SUBSET = {}
+
+    PREVIOUSLY_EXPORTED_USERS = []
+    PREVIOUSLY_EXPORTED_ROOMS = []
+
+    try:
+        with open("previous_users") as f:
+            for line in f:
+                PREVIOUSLY_EXPORTED_USERS.append(line.replace("\n", ""))
+    except FileNotFoundError:
+        with open("previous_users", "w+") as f:
+            print("Created empty file")
+    try:
+        with open("previous_rooms") as f:
+            for line in f:
+                PREVIOUSLY_EXPORTED_ROOMS.append(line.replace("\n", ""))
+    except FileNotFoundError:
+        with open("previous_rooms", "w+") as f:
+            print("Created empty file")
 
     # create dir for binary files
     if not os.path.isdir(FILE_DIR):
@@ -275,8 +308,8 @@ def main(argv=None):
         argv = sys.argv
     try:
         try:
-            opts, args = getopt.getopt(argv[1:], "hlmu:x:v",
-                                       ["help", "list", "messages", "user_token=", "extract_users="])
+            opts, args = getopt.getopt(argv[1:], "hlmu:x:r:v",
+                                       ["help", "list", "messages", "user_token=", "extract_users=", "extract_rooms="])
         except getopt.error as msg:
             raise Usage(msg)
 
@@ -295,52 +328,83 @@ def main(argv=None):
                 USER_TOKEN = value
             if option in ("-x", "--extract_users"):
                 IDS_TO_EXTRACT = value.split(',')
+            if option in ("-r", "--extract_rooms"):
+                ROOMS_TO_EXTRACT = value.split(',')
 
         # ensure that the token passed is a valid token length (real check happens later)
         if not USER_TOKEN or not len(USER_TOKEN) == 40:
             raise Usage("You must specify a valid HipChat user token!")
 
-        # Get the list of users
-        try:
-            USER_LIST = get_user_list(USER_TOKEN)
-        except ApiError as e:
-            print("Hipchat API returned HTTP {code}/{type}: {message}".format(**e.message))
-            return
-
-        # Validate user IDs and ensure they are present in the user list
-        if IDS_TO_EXTRACT:
-            for user_id in IDS_TO_EXTRACT:
-                try:
-                    int(user_id)
-                except ValueError:
-                    print("Invald user ID: %s." % (user_id))
-                    return 2
-
-                if user_id not in USER_LIST.keys():
-                    print("User ID %s not found in HipChat." % (user_id))
-                    print("Using id rather than name for directory")
-                    USER_SUBSET[user_id] = user_id
-                else:
-                    USER_SUBSET[user_id] = USER_LIST[user_id]
-
-        # If the action is listing only, display and exit
-        if ACTION == "DISPLAY":
-            display_userlist(USER_LIST)
-            sys.exit(0)
-
-        # Iterate through user list and export all 1-to-1 messages to disk
-        if USER_SUBSET:
-            extract = USER_SUBSET.items()
-        else:
-            extract = USER_LIST.items()
-
-        for user_id, user_name in extract:
-            log("\nExporting 1-to-1 messages for %s (ID: %s)..." % (user_name, user_id))
+        if ROOMS_TO_EXTRACT is None:
+            # Get the list of users
             try:
-                message_export(USER_TOKEN, user_id, user_name)
+                USER_LIST = get_user_list(USER_TOKEN)
             except ApiError as e:
                 print("Hipchat API returned HTTP {code}/{type}: {message}".format(**e.message))
                 return
+
+            # Validate user IDs and ensure they are present in the user list
+            if IDS_TO_EXTRACT:
+                for user_id in IDS_TO_EXTRACT:
+                    try:
+                        int(user_id)
+                    except ValueError:
+                        print("Invald user ID: %s." % (user_id))
+                        return 2
+
+                    if user_id not in USER_LIST.keys():
+                        print("User ID %s not found in HipChat." % (user_id))
+                        print("Using id rather than name for directory")
+                        USER_SUBSET[user_id] = user_id
+                    else:
+                        USER_SUBSET[user_id] = USER_LIST[user_id]
+
+            # If the action is listing only, display and exit
+            if ACTION == "DISPLAY":
+                display_userlist(USER_LIST)
+                sys.exit(0)
+
+            # Iterate through user list and export all 1-to-1 messages to disk
+            if USER_SUBSET:
+                extract = USER_SUBSET.items()
+            else:
+                extract = USER_LIST.items()
+
+            user_index = 0
+            for user_id, user_name in extract:
+                user_index = user_index + 1
+                if user_name in PREVIOUSLY_EXPORTED_USERS:
+                    log("[%d/%d]: Not exporting messages for %s, already previously exported" % (user_index, len(extract), user_name))
+                    continue
+                else:
+                    with open("previous_users", "a+") as f:
+                        f.write(user_name + "\n")
+                log("\n[%d/%d]: Exporting 1-to-1 messages for %s (ID: %s)..." % (user_index, len(extract), user_name, user_id))
+                try:
+                    message_export(USER_TOKEN, user_id, user_name, True)
+                except ApiError as e:
+                    print("Hipchat API returned HTTP {code}/{type}: {message}".format(**e.message))
+                    return
+        else:
+            if len(ROOMS_TO_EXTRACT) == 0:
+                print("Did not provide any room names to extract!")
+                return 2
+
+            room_index = 0
+            for name in ROOMS_TO_EXTRACT:
+                room_index = room_index + 1
+                if name in PREVIOUSLY_EXPORTED_ROOMS:
+                    log("[%d/%d]: Not exporting messages for %s, already previously exported" % (room_index, len(ROOMS_TO_EXTRACT), name))
+                    continue
+                else:
+                    with open("previous_rooms", "a+") as f:
+                        f.write(name + "\n")
+                log("\n[%d/%d]: Exporting Chat History for Room - %s" % (room_index, len(ROOMS_TO_EXTRACT), name))
+                try:
+                    message_export(USER_TOKEN, name, name, False)
+                except ApiError as e:
+                    print("Hipchat API returned HTTP {code}/{type}: {message}".format(**e.message))
+                    return
 
     except Usage as err:
         print("%s: %s" % (sys.argv[0].split("/")[-1], str(err.msg)), file=sys.stderr)

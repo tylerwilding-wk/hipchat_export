@@ -1,5 +1,12 @@
 hipchat_export/
 
+previous_rooms
+previous_users
+*.zip
+
+.idea/
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
