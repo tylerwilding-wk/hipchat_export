@@ -73,7 +73,7 @@ GET_FILE_UPLOADS = True
 EXPORT_DIR = os.path.join(os.getcwd(), 'hipchat_export')
 FILE_DIR = os.path.join(EXPORT_DIR, 'uploads')
 HIPCHAT_API_URL = "http://api.hipchat.com/v2"
-REQUESTS_RATE_LIMIT = 100
+REQUESTS_RATE_LIMIT = 1000
 TOTAL_REQUESTS = 0
 
 
